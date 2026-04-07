@@ -1,0 +1,26 @@
+# Requirements for TimesFM NWO Integration
+
+# Web Framework
+flask==3.0.0
+flask-limiter==3.5.0
+gunicorn==21.2.0
+
+# TimesFM and Dependencies
+# Note: TimesFM requires specific versions
+timesfm
+huggingface-hub>=0.19.0
+transformers>=4.35.0
+torch>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Data Processing
+pandas>=2.0.0
+pydantic>=2.0.0
+
+# Utilities
+python-dotenv==1.0.0
+requests>=2.31.0
+
+# Monitoring (optional)
+prometheus-client==0.19.0

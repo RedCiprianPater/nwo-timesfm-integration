@@ -1,0 +1,32 @@
+{
+  "name": "nwo-timesfm-integration",
+  "version": "1.0.0",
+  "description": "TimesFM integration for NWO Robotics API - Time series forecasting for robot maintenance and prediction",
+  "main": "src/server.py",
+  "scripts": {
+    "start": "python src/server.py",
+    "download-model": "python scripts/download_model.py",
+    "test": "pytest tests/",
+    "docker:build": "docker build -t nwo-timesfm .",
+    "docker:run": "docker run -p 8000:8000 nwo-timesfm"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RedCiprianPater/nwo-timesfm-integration"
+  },
+  "keywords": [
+    "timesfm",
+    "time-series",
+    "forecasting",
+    "robotics",
+    "nwo",
+    "maintenance-prediction",
+    "anomaly-detection"
+  ],
+  "author": "NWO Capital <ciprian.pater@publicae.org>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/RedCiprianPater/nwo-timesfm-integration/issues"
+  },
+  "homepage": "https://nwo.capital"
+}
