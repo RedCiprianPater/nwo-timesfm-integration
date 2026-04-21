@@ -24,3 +24,8 @@ requests>=2.31.0
 
 # Monitoring (optional)
 prometheus-client==0.19.0
+
+# Residual symbolic analysis — EML operator (arXiv:2603.21852).
+# Used by src/routes/eml_residual.py and src/residual_analyzer.py.
+# Swap for a pinned ==0.1.0 once the package is published to PyPI.
+nwo-eml-regression[sympy] @ git+https://github.com/RedCiprianPater/nwo-eml-regression.git
