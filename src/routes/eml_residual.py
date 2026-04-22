@@ -1,109 +1,92 @@
 """
-FastAPI route: POST /api/timesfm/residual-analysis
+Flask blueprint: POST /api/timesfm/residual-analysis
 
-Adds a symbolic-regression endpoint that extracts closed-form elementary
-laws from TimesFM forecast residuals. Based on Odrzywołek's EML operator
-(arXiv:2603.21852).
+Recovers closed-form elementary laws from TimesFM forecast residuals.
 
-Registered into `src/server.py` via the patch shown in INTEGRATION.md.
+Based on:
+    Andrzej Odrzywołek,
+    "All elementary functions from a single binary operator",
+    arXiv:2603.21852 (2026).
+
+Registered from src/server.py:
+
+    from src.routes.eml_residual import bp as eml_residual_bp
+    app.register_blueprint(eml_residual_bp)
 """
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from flask import Blueprint, jsonify, request
 from pydantic import BaseModel, Field, ValidationError
 
 from ..residual_analyzer import TimesFMResidualAnalyzer
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/timesfm", tags=["residual-analysis"])
+bp = Blueprint("eml_residual", __name__, url_prefix="/api/timesfm")
 
 
 # ---------------------------------------------------------------------------
-# Schemas
+# Request schema (Pydantic v2)
 # ---------------------------------------------------------------------------
 
 class ResidualAnalysisRequest(BaseModel):
     """Input for POST /api/timesfm/residual-analysis."""
 
-    features: list[list[float]] = Field(
-        ...,
-        description="Feature matrix, shape (n_samples, n_features). "
-                    "Each row is the context for one forecasted point.",
-    )
-    y_true: list[float] = Field(
-        ...,
-        description="Ground-truth values aligned to features rows.",
-    )
-    y_forecast: list[float] = Field(
-        ...,
-        description="TimesFM forecasts aligned to features rows.",
-    )
-    feature_names: list[str] | None = Field(
-        default=None,
-        description="Optional column names, used when rendering the expression.",
-    )
-    depth: int | None = Field(
-        default=None,
-        ge=1,
-        le=6,
-        description="Tree depth (1–6). Omit to use automatic depth search.",
-    )
+    features: list
+    y_true: list
+    y_forecast: list
+    feature_names: list | None = None
+    depth: int | None = Field(default=None, ge=1, le=6)
     n_epochs: int = Field(default=2000, ge=100, le=20000)
-    seed: int = Field(default=0)
-
-
-class ResidualAnalysisResponse(BaseModel):
-    expression: str
-    simplified: str
-    final_loss: float
-    tree_size: int
-    depth_used: int
-    n_samples: int
-    feature_names: list[str]
-    paper_reference: str
-    summary: str
+    seed: int = 0
 
 
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 
-@router.post("/residual-analysis", response_model=ResidualAnalysisResponse)
-async def residual_analysis(req: ResidualAnalysisRequest) -> ResidualAnalysisResponse:
+@bp.route("/residual-analysis", methods=["POST"])
+def residual_analysis():
     """Fit a closed-form elementary law to TimesFM forecast residuals.
 
     The endpoint is stateless — each call trains a fresh EML tree on the
     submitted (features, y_true, y_forecast) tuple and returns the best
     closed-form expression it can recover for `y_true − y_forecast`.
 
-    Typical use cases:
+    Returns JSON:
+        expression       — raw eml(...) form extracted from the trained tree
+        simplified       — human-readable SymPy-simplified closed form
+        final_loss       — MSE on residuals after training
+        tree_size        — node count in the extracted tree
+        depth_used       — depth chosen by depth search (or supplied)
+        n_samples        — residual points used for the fit
+        feature_names    — column labels passed through into the expression
+        paper_reference  — always "Odrzywołek, arXiv:2603.21852 (2026)"
+        summary          — one-line human-readable summary
 
-    - **Maintenance prediction**: residual has a clean aging curve
-      (e.g. `log(hrs)` or `sqrt(hrs)`) → add as explicit feature in the
-      next TimesFM finetune.
-    - **Anomaly detection**: residual has a structured periodic component
-      → systematic bias, not a real anomaly.
-    - **Swarm load forecasting**: closed-form law is small enough to
-      deploy on-robot, sidestepping the need for on-device TimesFM.
-
-    Raises
-    ------
-    400
-        Input shapes don't match, or fewer than 8 samples.
-    500
-        Fit failed (usually numerical — try higher `n_epochs` or a
-        different `seed`).
+    Status codes:
+        200   fit completed (check `final_loss` to judge quality)
+        400   input validation failure
+        500   unexpected fit failure (try more `n_epochs` or a different `seed`)
     """
-    try:
-        analyzer = TimesFMResidualAnalyzer(
-            depth=req.depth or 3,
-            n_epochs=req.n_epochs,
-            seed=req.seed,
-        )
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "request body must be JSON"}), 400
 
+    try:
+        req = ResidualAnalysisRequest(**payload)
+    except ValidationError as e:
+        return jsonify({"error": "validation failed", "details": e.errors()}), 400
+
+    analyzer = TimesFMResidualAnalyzer(
+        depth=req.depth or 3,
+        n_epochs=req.n_epochs,
+        seed=req.seed,
+    )
+
+    try:
         if req.depth is None:
             law = analyzer.analyze_with_depth_search(
                 features=req.features,
@@ -119,28 +102,25 @@ async def residual_analysis(req: ResidualAnalysisRequest) -> ResidualAnalysisRes
                 feature_names=req.feature_names,
             )
     except ValueError as e:
-        # Input-validation style errors — surface as 400.
-        raise HTTPException(status_code=400, detail=str(e))
-    except ValidationError as e:
-        raise HTTPException(status_code=400, detail=e.errors())
+        return jsonify({"error": str(e)}), 400
     except Exception as e:  # noqa: BLE001
         logger.exception("EML residual fit failed")
-        raise HTTPException(
-            status_code=500,
-            detail=f"residual analysis failed: {e}",
-        )
+        return jsonify({
+            "error": f"residual analysis failed: {e}",
+            "hint": "try increasing n_epochs or changing seed",
+        }), 500
 
-    return ResidualAnalysisResponse(
-        expression=law.expression,
-        simplified=law.simplified,
-        final_loss=law.final_loss,
-        tree_size=law.tree_size,
-        depth_used=law.depth_used,
-        n_samples=law.n_samples,
-        feature_names=law.feature_names,
-        paper_reference=law.paper_reference,
-        summary=law.summary_line(),
-    )
+    return jsonify({
+        "expression":      law.expression,
+        "simplified":      law.simplified,
+        "final_loss":      law.final_loss,
+        "tree_size":       law.tree_size,
+        "depth_used":      law.depth_used,
+        "n_samples":       law.n_samples,
+        "feature_names":   law.feature_names,
+        "paper_reference": law.paper_reference,
+        "summary":         law.summary_line(),
+    }), 200
 
 
-__all__ = ["router"]
+__all__ = ["bp"]
