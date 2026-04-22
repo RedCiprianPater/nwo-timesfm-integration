@@ -8,6 +8,7 @@ Also exposes the EML residual-analysis endpoint from Odrzywołek
 """
 
 import os
+import sys
 import json
 import time
 from datetime import datetime, timedelta
@@ -26,7 +27,7 @@ try:
     TIMEFM_AVAILABLE = True
 except ImportError:
     TIMEFM_AVAILABLE = False
-    print("Warning: TimesFM not installed. Using mock predictions.")
+    print("Warning: TimesFM not installed. Using mock predictions.", flush=True)
 
 app = Flask(__name__)
 
@@ -48,12 +49,12 @@ def mock_forecast(history: List[float], horizon: int) -> Dict[str, Any]:
     """Generate mock forecasts when model is not available"""
     last_value = history[-1] if history else 0
     trend = (history[-1] - history[0]) / len(history) if len(history) > 1 else 0
-    
+
     forecast = []
     for i in range(horizon):
         value = last_value + trend * (i + 1) + np.random.normal(0, abs(trend) * 0.1)
         forecast.append(round(value, 2))
-    
+
     return {
         "forecast": forecast,
         "p10": [v * 0.9 for v in forecast],
@@ -63,21 +64,21 @@ def mock_forecast(history: List[float], horizon: int) -> Dict[str, Any]:
 
 class TimesFMPredictor:
     """Wrapper for TimesFM model"""
-    
+
     def __init__(self):
         self.model = None
         self.device = "cpu"
         self.load_model()
-    
+
     def load_model(self):
         """Load TimesFM 2.5 model from HuggingFace"""
         if not TIMEFM_AVAILABLE:
-            print("TimesFM not available, using mock predictions")
+            print("TimesFM not available, using mock predictions", flush=True)
             return
-        
+
         try:
-            print("Loading TimesFM 2.5 model...")
-            
+            print("Loading TimesFM 2.5 model...", flush=True)
+
             self.model = TimesFm(
                 context_len=512,
                 horizon_len=128,
@@ -87,20 +88,20 @@ class TimesFMPredictor:
                 model_dims=1280,
                 backend="cpu",
             )
-            
+
             checkpoint_path = hf_hub_download(
                 repo_id="google/timesfm-2.5-200m",
                 filename="timesfm-2.5-200m.pth"
             )
-            
+
             self.model.load_from_checkpoint(checkpoint_path)
-            print(f"Model loaded successfully from {checkpoint_path}")
-            
+            print(f"Model loaded successfully from {checkpoint_path}", flush=True)
+
         except Exception as e:
-            print(f"Error loading model: {e}")
-            print("Falling back to mock predictions")
+            print(f"Error loading model: {e}", flush=True)
+            print("Falling back to mock predictions", flush=True)
             self.model = None
-    
+
     def predict(self, history: List[float], horizon: int, freq: str = "H") -> Dict[str, Any]:
         """Generate forecast"""
         if self.model is None:
@@ -124,7 +125,7 @@ class TimesFMPredictor:
                 "p90": [round(v, 2) for v in p90]
             }
         except Exception as e:
-            print(f"Prediction error: {e}")
+            print(f"Prediction error: {e}", flush=True)
             return mock_forecast(history, horizon)
 
 # Initialize predictor
@@ -150,16 +151,44 @@ def require_api_key(f):
 # Registers POST /api/timesfm/residual-analysis which recovers closed-form
 # elementary laws from forecast residuals using Odrzywołek's EML operator
 # (arXiv:2603.21852). See src/routes/eml_residual.py.
+#
+# Progressive diagnostics — each step prints before and after with
+# flush=True so gunicorn cannot buffer the output. If any step fails,
+# the traceback tells us exactly which import broke.
 # ============================================================================
-print(">>> Attempting to register EML residual-analysis blueprint ...")
+print(">>> [EML 1/5] Starting blueprint registration ...", flush=True)
+sys.stdout.flush()
+
 try:
+    print(">>> [EML 2/5] Importing nwo_eml package ...", flush=True)
+    import nwo_eml
+    _nwo_eml_version = getattr(nwo_eml, "__version__", "unknown")
+    print(f">>> [EML 2/5] OK - nwo_eml version={_nwo_eml_version}", flush=True)
+
+    print(">>> [EML 3/5] Importing nwo_eml.simplify ...", flush=True)
+    from nwo_eml.simplify import simplify_tree  # noqa: F401
+    print(">>> [EML 3/5] OK - nwo_eml.simplify imported", flush=True)
+
+    print(">>> [EML 4/5] Importing TimesFMResidualAnalyzer ...", flush=True)
+    from src.residual_analyzer import TimesFMResidualAnalyzer  # noqa: F401
+    print(">>> [EML 4/5] OK - TimesFMResidualAnalyzer imported", flush=True)
+
+    print(">>> [EML 5/5] Importing blueprint and registering ...", flush=True)
     from src.routes.eml_residual import bp as eml_residual_bp
     app.register_blueprint(eml_residual_bp)
-    print(">>> SUCCESS: EML residual-analysis endpoint registered at /api/timesfm/residual-analysis")
+    print(">>> [EML 5/5] OK - blueprint registered", flush=True)
+
+    # Dump all registered Flask routes for visual confirmation.
+    print(">>> Flask URL map after registration:", flush=True)
+    for rule in app.url_map.iter_rules():
+        print(f">>>     {sorted(rule.methods)} {rule.rule}", flush=True)
+    print(">>> EML registration complete", flush=True)
+
 except Exception as e:
     import traceback
-    print(f">>> FAILED to register EML blueprint: {type(e).__name__}: {e}")
-    print(traceback.format_exc())
+    print(f">>> EML FAILED: {type(e).__name__}: {e}", flush=True)
+    print(traceback.format_exc(), flush=True)
+    sys.stdout.flush()
 
 # Health check endpoint
 @app.route('/api/timesfm/health', methods=['GET'])
@@ -357,6 +386,6 @@ def internal_error(e):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     debug = os.environ.get('DEBUG', 'false').lower() == 'true'
-    print(f"Starting TimesFM server on port {port}")
-    print(f"Model loaded: {predictor.model is not None}")
+    print(f"Starting TimesFM server on port {port}", flush=True)
+    print(f"Model loaded: {predictor.model is not None}", flush=True)
     app.run(host='0.0.0.0', port=port, debug=debug)
