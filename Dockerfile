@@ -25,4 +25,4 @@ RUN python scripts/download_model.py || echo "Model download failed, will use mo
 EXPOSE 8000
 
 # Run server
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "src.server:app"]
+CMD gunicorn --workers 1 --threads 2 --timeout 180 --bind 0.0.0.0:$PORT src.server:app
