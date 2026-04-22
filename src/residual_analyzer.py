@@ -1,213 +1,126 @@
 """
-TimesFM forecast residual → closed-form elementary law.
+Flask blueprint: POST /api/timesfm/residual-analysis
 
-Fits a differentiable EML symbolic-regression tree to
-`residual = y_true - y_forecast` against a feature matrix, then returns
-any closed-form elementary expression the tree recovers.
+Recovers closed-form elementary laws from TimesFM forecast residuals.
 
-The math comes from
-
+Based on:
     Andrzej Odrzywołek,
     "All elementary functions from a single binary operator",
     arXiv:2603.21852 (2026).
 
-The operator `eml(x, y) = exp(x) - ln(y)` together with the constant 1
-generates the entire scientific-calculator basis, so any elementary law
-hiding in TimesFM's systematic error is representable as a shallow EML
-tree. This module is the service-layer wrapper that calls the underlying
-regressor (from the `nwo-eml-regression` package) and shapes inputs and
-outputs for the NWO API.
+Registered from src/server.py:
 
-Typical call site is `src/routes/eml_residual.py`, which exposes it as
-`POST /api/timesfm/residual-analysis`.
+    from src.routes.eml_residual import bp as eml_residual_bp
+    app.register_blueprint(eml_residual_bp)
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import logging
 
-import numpy as np
+from flask import Blueprint, jsonify, request
+from pydantic import BaseModel, Field, ValidationError
 
-try:
-    from nwo_eml import EMLRegressor
-    from nwo_eml.simplify import simplify_tree
-except ImportError as e:  # pragma: no cover
-    raise ImportError(
-        "nwo-eml-regression is required. Install with:\n"
-        "    pip install 'nwo-eml-regression[sympy]'\n"
-        "or, from the NWO fork:\n"
-        "    pip install 'git+https://github.com/RedCiprianPater/nwo-eml-regression'"
-    ) from e
+from ..residual_analyzer import TimesFMResidualAnalyzer
+
+logger = logging.getLogger(__name__)
+
+bp = Blueprint("eml_residual", __name__, url_prefix="/api/timesfm")
 
 
 # ---------------------------------------------------------------------------
+# Request schema (Pydantic v2)
+# ---------------------------------------------------------------------------
 
-@dataclass
-class ResidualLaw:
-    """A recovered symbolic relationship for the forecast residual."""
+class ResidualAnalysisRequest(BaseModel):
+    """Input for POST /api/timesfm/residual-analysis."""
 
-    expression: str           # raw eml(...) form extracted from the trained tree
-    simplified: str           # human-readable closed form (best-effort SymPy pass)
-    final_loss: float         # MSE on the residuals after training
-    tree_size: int            # number of nodes in the extracted tree
-    depth_used: int           # actual tree depth used for this fit
-    n_samples: int            # number of residual points the law was fit on
-    feature_names: list[str]  # columns used, in order
-    paper_reference: str = "Odrzywołek, arXiv:2603.21852 (2026)"
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    def summary_line(self) -> str:
-        return (
-            f"residual ≈ {self.simplified}  "
-            f"(loss={self.final_loss:.3e}, size={self.tree_size}, "
-            f"depth={self.depth_used})"
-        )
+    features: list
+    y_true: list
+    y_forecast: list
+    feature_names: list | None = None
+    depth: int | None = Field(default=None, ge=1, le=6)
+    n_epochs: int = Field(default=2000, ge=100, le=20000)
+    seed: int = 0
 
 
 # ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
 
-class TimesFMResidualAnalyzer:
-    """Fit an EML symbolic-regression tree to TimesFM forecast residuals.
+@bp.route("/residual-analysis", methods=["POST"])
+def residual_analysis():
+    """Fit a closed-form elementary law to TimesFM forecast residuals.
 
-    Parameters
-    ----------
-    depth
-        Default tree depth when not using `analyze_with_depth_search`.
-        The paper reports exact recovery at depths ≤ 4 for elementary
-        generators; NWO's typical residuals fit at depth 3.
-    n_epochs
-        Adam optimiser steps. 2000 is usually enough for clean signals;
-        raise to 5000 for noisy residuals.
-    normalize
-        Z-score features before fitting. Strongly recommended — the
-        guarded `exp`/`ln` operator behaves best when inputs are in
-        roughly `[-3, 3]`.
-    seed
-        RNG seed for reproducibility across API calls.
+    The endpoint is stateless — each call trains a fresh EML tree on the
+    submitted (features, y_true, y_forecast) tuple and returns the best
+    closed-form expression it can recover for `y_true − y_forecast`.
+
+    Returns JSON:
+        expression       — raw eml(...) form extracted from the trained tree
+        simplified       — human-readable SymPy-simplified closed form
+        final_loss       — MSE on residuals after training
+        tree_size        — node count in the extracted tree
+        depth_used       — depth chosen by depth search (or supplied)
+        n_samples        — residual points used for the fit
+        feature_names    — column labels passed through into the expression
+        paper_reference  — always "Odrzywołek, arXiv:2603.21852 (2026)"
+        summary          — one-line human-readable summary
+
+    Status codes:
+        200   fit completed (check `final_loss` to judge quality)
+        400   input validation failure
+        500   unexpected fit failure (try more `n_epochs` or a different `seed`)
     """
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "request body must be JSON"}), 400
 
-    def __init__(
-        self,
-        *,
-        depth: int = 3,
-        n_epochs: int = 2000,
-        normalize: bool = True,
-        seed: int = 0,
-    ) -> None:
-        self.depth = depth
-        self.n_epochs = n_epochs
-        self.normalize = normalize
-        self.seed = seed
+    try:
+        req = ResidualAnalysisRequest(**payload)
+    except ValidationError as e:
+        return jsonify({"error": "validation failed", "details": e.errors()}), 400
 
-    # -- core API ----------------------------------------------------------
+    analyzer = TimesFMResidualAnalyzer(
+        depth=req.depth or 3,
+        n_epochs=req.n_epochs,
+        seed=req.seed,
+    )
 
-    def analyze(
-        self,
-        features: np.ndarray | list,
-        y_true: np.ndarray | list,
-        y_forecast: np.ndarray | list,
-        *,
-        feature_names: list[str] | None = None,
-    ) -> ResidualLaw:
-        """Fit a closed-form law to `y_true − y_forecast`.
-
-        Parameters
-        ----------
-        features
-            Matrix of shape `(n_samples, n_features)`. Each row is the
-            context for one forecasted point — operating hours, payload
-            mass, ambient temperature, battery level, whatever you track.
-        y_true
-            Ground-truth values, aligned row-wise with `features`.
-        y_forecast
-            TimesFM forecasts, aligned row-wise with `features`.
-        feature_names
-            Optional, used when rendering the extracted expression.
-        """
-        features = np.asarray(features, dtype=float)
-        y_true = np.asarray(y_true, dtype=float).ravel()
-        y_forecast = np.asarray(y_forecast, dtype=float).ravel()
-
-        if features.ndim == 1:
-            features = features.reshape(-1, 1)
-
-        n = features.shape[0]
-        if not (len(y_true) == len(y_forecast) == n):
-            raise ValueError(
-                "features, y_true, and y_forecast must all have length "
-                f"{n}, got {len(y_true)} and {len(y_forecast)}"
+    try:
+        if req.depth is None:
+            law = analyzer.analyze_with_depth_search(
+                features=req.features,
+                y_true=req.y_true,
+                y_forecast=req.y_forecast,
+                feature_names=req.feature_names,
             )
-        if n < 8:
-            raise ValueError(
-                "need at least 8 samples for a meaningful residual fit; "
-                f"got {n}"
+        else:
+            law = analyzer.analyze(
+                features=req.features,
+                y_true=req.y_true,
+                y_forecast=req.y_forecast,
+                feature_names=req.feature_names,
             )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:  # noqa: BLE001
+        logger.exception("EML residual fit failed")
+        return jsonify({
+            "error": f"residual analysis failed: {e}",
+            "hint": "try increasing n_epochs or changing seed",
+        }), 500
 
-        residual = y_true - y_forecast
-
-        X = features
-        if self.normalize:
-            std = features.std(axis=0)
-            std = np.where(std < 1e-8, 1.0, std)  # guard constant columns
-            X = (features - features.mean(axis=0)) / std
-
-        names = feature_names or [f"x{i}" for i in range(X.shape[1])]
-
-        reg = EMLRegressor(
-            depth=self.depth,
-            n_epochs=self.n_epochs,
-            seed=self.seed,
-        ).fit(X, residual, feature_names=names)
-
-        return ResidualLaw(
-            expression=reg.result_.expression,
-            simplified=simplify_tree(reg.result_.tree),
-            final_loss=reg.result_.final_loss,
-            tree_size=reg.result_.tree.size(),
-            depth_used=self.depth,
-            n_samples=n,
-            feature_names=names,
-        )
-
-    # -- depth search for parsimony ---------------------------------------
-
-    def analyze_with_depth_search(
-        self,
-        features: np.ndarray | list,
-        y_true: np.ndarray | list,
-        y_forecast: np.ndarray | list,
-        *,
-        depths: list[int] | None = None,
-        feature_names: list[str] | None = None,
-        min_improvement_factor: float = 0.5,
-    ) -> ResidualLaw:
-        """Pick the shallowest tree that fits well.
-
-        Tries the given depths in order; stops climbing once the loss
-        fails to drop by at least `min_improvement_factor` (i.e. the
-        new fit must be at most half the previous loss to be worth the
-        extra depth).
-        """
-        depths = depths or [2, 3, 4]
-        best: ResidualLaw | None = None
-
-        for d in depths:
-            self.depth = d
-            law = self.analyze(
-                features, y_true, y_forecast,
-                feature_names=feature_names,
-            )
-            if best is None:
-                best = law
-                continue
-            if law.final_loss < best.final_loss * min_improvement_factor:
-                best = law
-            else:
-                break
-
-        assert best is not None
-        return best
+    return jsonify({
+        "expression":      law.expression,
+        "simplified":      law.simplified,
+        "final_loss":      law.final_loss,
+        "tree_size":       law.tree_size,
+        "depth_used":      law.depth_used,
+        "n_samples":       law.n_samples,
+        "feature_names":   law.feature_names,
+        "paper_reference": law.paper_reference,
+        "summary":         law.summary_line(),
+    }), 200
 
 
-__all__ = ["TimesFMResidualAnalyzer", "ResidualLaw"]
+__all__ = ["bp"]
