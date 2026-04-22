@@ -1,16 +1,19 @@
-# Requirements for TimesFM NWO Integration
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 # Web Framework
 flask==3.0.0
 flask-limiter==3.5.0
 gunicorn==21.2.0
 
-# TimesFM and Dependencies
-# Note: TimesFM requires specific versions
+# TimesFM and Dependencies (for future forecast endpoints)
 timesfm
 huggingface-hub>=0.19.0
 transformers>=4.35.0
+
+# Torch CPU-only — the --extra-index-url at the top is what keeps this small
 torch>=2.0.0
+
+# Scientific stack
 numpy>=1.24.0
 scipy>=1.10.0
 
@@ -25,7 +28,5 @@ requests>=2.31.0
 # Monitoring (optional)
 prometheus-client==0.19.0
 
-# Residual symbolic analysis — EML operator (arXiv:2603.21852).
-# Used by src/routes/eml_residual.py and src/residual_analyzer.py.
-# Swap for a pinned ==0.1.0 once the package is published to PyPI.
+# EML symbolic regression (arXiv:2603.21852) — powers /residual-analysis
 nwo-eml-regression[sympy] @ git+https://github.com/RedCiprianPater/nwo-eml-regression.git
