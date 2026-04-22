@@ -359,4 +359,129 @@ def detect_anomaly():
     threshold = historical_mean + (historical_std * 2)  # 2 sigma
     
     # Detect anomalies
-    a
+    anomaly_detected = any(v > threshold for v in forecast_values)
+    max_value = max(forecast_values)
+    anomaly_probability = min(1.0, (max_value - historical_mean) / (threshold - historical_mean))
+    
+    # Find predicted anomaly time
+    anomaly_time = None
+    for i, v in enumerate(forecast_values):
+        if v > threshold:
+            anomaly_time = datetime.utcnow() + timedelta(minutes=i)
+            break
+    
+    # Determine severity
+    if anomaly_probability > 0.9:
+        severity = "critical"
+        action = "immediate_maintenance"
+    elif anomaly_probability > 0.7:
+        severity = "high"
+        action = "inspect_sensor"
+    elif anomaly_probability > 0.5:
+        severity = "medium"
+        action = "monitor_closely"
+    else:
+        severity = "low"
+        action = "none"
+    
+    return jsonify({
+        "sensor_type": sensor_type,
+        "robot_id": robot_id,
+        "anomaly_detected": anomaly_detected,
+        "anomaly_probability": round(anomaly_probability, 2),
+        "predicted_anomaly_time": anomaly_time.isoformat() + "Z" if anomaly_time else None,
+        "forecast": forecast_values[:10],  # Return first 10 for brevity
+        "threshold": round(threshold, 3),
+        "historical_mean": round(historical_mean, 3),
+        "recommended_action": action,
+        "severity": severity
+    })
+
+# Swarm load prediction endpoint
+@app.route('/api/timesfm/swarm-load', methods=['POST'])
+@limiter.limit("100 per minute")
+@require_api_key
+def predict_swarm_load():
+    """Predict swarm resource needs"""
+    global request_count
+    request_count += 1
+    
+    data = request.get_json()
+    
+    if not data or 'task_queue_history' not in data:
+        return jsonify({
+            "error": "Invalid request",
+            "message": "task_queue_history array required",
+            "code": "INVALID_INPUT"
+        }), 400
+    
+    history = data.get('task_queue_history', [])
+    if len(history) < 5:
+        return jsonify({
+            "error": "Invalid request",
+            "message": "task_queue_history must contain at least 5 data points",
+            "code": "INVALID_INPUT"
+        }), 400
+    
+    swarm_id = data.get('swarm_id', 'unknown')
+    active_robots = data.get('active_robots', 1)
+    horizon = min(data.get('horizon', 48), 128)
+    
+    # Generate forecast
+    forecast_data = predictor.predict(history, horizon)
+    queue_forecast = forecast_data['forecast']
+    
+    # Calculate recommended robots
+    avg_queue = np.mean(queue_forecast)
+    tasks_per_robot = 5  # Assumption: each robot handles 5 tasks
+    recommended_robots = max(active_robots, int(np.ceil(avg_queue / tasks_per_robot)))
+    
+    scale_up_recommended = recommended_robots > active_robots
+    
+    # Find optimal scale time
+    scale_time = None
+    for i, q in enumerate(queue_forecast):
+        if q > active_robots * tasks_per_robot:
+            scale_time = datetime.utcnow() + timedelta(hours=i)
+            break
+    
+    # Calculate confidence
+    trend = np.polyfit(range(len(history)), history, 1)[0]
+    confidence = min(0.95, 0.6 + abs(trend) * 0.1)
+    
+    return jsonify({
+        "swarm_id": swarm_id,
+        "active_robots": active_robots,
+        "predicted_queue_depth": [round(q, 0) for q in queue_forecast[:10]],
+        "recommended_robots": recommended_robots,
+        "scale_up_recommended": scale_up_recommended,
+        "optimal_scale_time": scale_time.isoformat() + "Z" if scale_time else None,
+        "confidence": round(confidence, 2),
+        "tasks_per_robot_assumption": tasks_per_robot
+    })
+
+# Error handlers
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({
+        "error": "Rate limit exceeded",
+        "message": str(e.description),
+        "retry_after": 60
+    }), 429
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({
+        "error": "Internal server error",
+        "message": "An unexpected error occurred",
+        "code": "INTERNAL_ERROR"
+    }), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8000))
+    debug = os.environ.get('DEBUG', 'false').lower() == 'true'
+    
+    print(f"Starting TimesFM server on port {port}")
+    print(f"Model loaded: {predictor.model is not None}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
